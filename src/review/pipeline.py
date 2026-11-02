@@ -324,6 +324,31 @@ def _validate_synthesis_result(
         )
 
 
+def synthesize_review_result(partial: ReviewPartial) -> ReviewResult:
+    """Project validated findings into the publication model without rewriting them."""
+    fields = {
+        "mismatch": "mismatches",
+        "spec_doc": "spec_doc_findings",
+        "architecture": "architecture_findings",
+        "advisory": "advisory_findings",
+        **dict.fromkeys(
+            ("bug", "vulnerability", "security", "smell", "complexity"),
+            "quality_findings",
+        ),
+    }
+    payload = partial.model_dump(exclude={"unit_id", "covered_paths", "findings"})
+    for finding in partial.findings:
+        category = finding.category.casefold()
+        field = fields[category]
+        row = finding.model_dump(exclude={"category", "severity"})
+        if field == "quality_findings":
+            row["category"] = category
+        payload.setdefault(field, []).append(row)
+    result = ReviewResult.model_validate(payload)
+    _validate_synthesis_result(result, partial)
+    return result
+
+
 def reduce_review_partials(
     partials: list[ReviewPartial], paths: list[str]
 ) -> ReviewPartial:
@@ -661,31 +686,12 @@ async def run_review_pipeline(
     try:
         partials = await asyncio.gather(*tasks)
         reduced = reduce_review_partials(list(partials), plan.coverage.required_paths)
-        synthesis_system, synthesis_user = _synthesis_prompts(
-            [reduced], plan.coverage.required_paths
-        )
         try:
-            final = await gpt_client.review(
-                synthesis_system,
-                synthesis_user,
-                model=model,
-                tool_executor=None,
-                reasoning_effort=reasoning_effort,
-                max_completion_tokens=output_cap,
-                cost_ledger=ledger,
-                cost_stage="synthesis",
-                pre_reserved_call_id=synthesis_reservation_id,
-                response_model=ReviewResult,
-            )
-            if not isinstance(final, ReviewResult):
-                raise ReviewInfraError(
-                    ReviewInfraCategory.RESPONSE_SCHEMA_ERROR,
-                    "Synthesis did not return ReviewResult",
-                )
-            _validate_synthesis_result(final, reduced)
+            final = synthesize_review_result(reduced)
         except ReviewInfraError as exc:
             exc.stage = "synthesis"
             raise
+        await ledger.cancel_reservation(synthesis_reservation_id, missing_ok=True)
         return PipelineOutcome(result=final, ledger=ledger)
     except BaseException:
         for task in tasks:

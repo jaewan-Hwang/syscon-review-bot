@@ -316,8 +316,8 @@ async def test_multi_pipeline_uses_shared_ledger_and_returns_one_final_result():
         cost_policy=CostPolicy(hard_limit_usd="1.00"),
     )
 
-    assert outcome.result.summary == "final"
-    assert gpt.review.await_count == 4
+    assert all(part in outcome.result.summary for part in ("shard-1", "shard-2", "global"))
+    assert gpt.review.await_count == 3
     assert all(
         call.kwargs["response_model"] is ReviewPartial
         for call in gpt.review.await_args_list[:3]
@@ -326,9 +326,6 @@ async def test_multi_pipeline_uses_shared_ledger_and_returns_one_final_result():
         "ReviewPartial" in call.args[0] and "ReviewResult" not in call.args[0]
         for call in gpt.review.await_args_list[:3]
     )
-    assert gpt.review.await_args_list[3].kwargs["response_model"] is ReviewResult
-    assert "ReviewResult" in gpt.review.await_args_list[3].args[0]
-    assert "ReviewPartial" not in gpt.review.await_args_list[3].args[0]
     ledgers = [call.kwargs["cost_ledger"] for call in gpt.review.await_args_list]
     assert len({id(ledger) for ledger in ledgers}) == 1
 
@@ -906,7 +903,7 @@ async def test_multi_pipeline_rejects_missing_attested_coverage():
 
 
 @pytest.mark.asyncio
-async def test_synthesis_cannot_drop_an_internal_finding():
+async def test_synthesis_preserves_an_internal_finding_without_requesting_a_rewrite():
     files = _files(2)
     plan = build_review_plan(
         files,
@@ -933,20 +930,68 @@ async def test_synthesis_cannot_drop_an_internal_finding():
         _result("incorrectly empty"),
     ]
 
-    with pytest.raises(ReviewInfraError) as exc_info:
-        await run_review_pipeline(
-            plan=plan,
-            files=files,
-            gpt_client=gpt,
-            system_prompt="system",
-            pr_title="title",
-            pr_body="body",
-            base_branch="main",
-            head_branch="feature",
-            model="gpt-5.4-mini",
-            cost_policy=CostPolicy(hard_limit_usd="1"),
-        )
+    outcome = await run_review_pipeline(
+        plan=plan,
+        files=files,
+        gpt_client=gpt,
+        system_prompt="system",
+        pr_title="title",
+        pr_body="body",
+        base_branch="main",
+        head_branch="feature",
+        model="gpt-5.4-mini",
+        cost_policy=CostPolicy(hard_limit_usd="1"),
+    )
 
-    assert exc_info.value.category is ReviewInfraCategory.RESPONSE_SCHEMA_ERROR
-    assert exc_info.value.stage == "synthesis"
-    assert exc_info.value.unit_id is None
+    assert len(outcome.result.mismatches) == 1
+    assert outcome.result.mismatches[0].description == "required finding"
+    assert outcome.result.mismatches[0].suggestion == "fix"
+    assert gpt.review.await_count == len(plan.units) + 1
+
+
+@pytest.mark.asyncio
+async def test_multi_pipeline_preserves_complete_findings_without_rewriting_them():
+    files = _files(2)
+    plan = build_review_plan(
+        files,
+        policy=SizeRoutingPolicy(single_max_tokens=1, max_tokens_per_shard=30_000),
+        token_counter=len,
+    )
+    first = _partial(plan.units[0].unit_id, plan.units[0].paths)
+    first.aligned = False
+    first.prior_resolved = ["earlier issue → verified fix"]
+    categories = ["mismatch", "spec_doc", "architecture", "bug", "vulnerability",
+                  "security", "smell", "complexity", "advisory"]
+    for index, category in enumerate(categories):
+        first.findings.append(ScopedFinding(
+            category=category, severity="high", file=plan.units[0].paths[0],
+            line=index + 1, description=(category + "  original\n") * 300,
+            suggestion="preserve  spacing\nand every finding", confidence=91,
+        ))
+    gpt = AsyncMock()
+    gpt.review.side_effect = [
+        first,
+        _partial(plan.units[1].unit_id, plan.units[1].paths),
+        _partial("global", plan.coverage.required_paths),
+    ]
+    outcome = await run_review_pipeline(
+        plan=plan, files=files, gpt_client=gpt, system_prompt="system",
+        pr_title="title", pr_body="body", base_branch="main", head_branch="feature",
+        model="gpt-5.4-mini", cost_policy=CostPolicy(hard_limit_usd="1"),
+    )
+    final = outcome.result
+    rows = {}
+    for category, field in [("mismatch", "mismatches"), ("spec_doc", "spec_doc_findings"),
+                            ("architecture", "architecture_findings"), ("advisory", "advisory_findings")]:
+        rows[category] = getattr(final, field)[0]
+    rows.update({row.category.value: row for row in final.quality_findings})
+    assert set(rows) == set(categories)
+    for original in first.findings:
+        actual = rows[original.category]
+        for key in ("file", "line", "description", "suggestion", "confidence"):
+            assert getattr(actual, key) == getattr(original, key)
+    assert not final.aligned
+    assert final.spec_status == first.spec_status
+    assert final.prior_resolved == first.prior_resolved
+    assert gpt.review.await_count == len(plan.units) + 1
+    assert outcome.ledger.reserved_nusd == 0

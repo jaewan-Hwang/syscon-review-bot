@@ -546,7 +546,7 @@ async def test_multi_review_is_internal_and_posts_one_normal_review(context, ali
         result = await review_pr(context, mock_github, mock_gpt)
 
     assert result.route is ReviewRoute.MULTI
-    assert mock_gpt.review.await_count == 4
+    assert mock_gpt.review.await_count == 3
     mock_github.post.assert_awaited_once()
     body = mock_github.post.call_args.kwargs["json_data"]["body"]
     assert "Approved" in body
