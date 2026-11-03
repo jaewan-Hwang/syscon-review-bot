@@ -1,5 +1,6 @@
 import asyncio
 import json
+from typing import Any
 from uuid import uuid4
 
 import openai
@@ -140,6 +141,7 @@ class GPTClient:
         cost_stage: str = "review",
         pre_reserved_call_id: str | None = None,
         response_model: type[BaseModel] = ReviewResult,
+        response_format: dict[str, Any] | None = None,
     ) -> BaseModel:
         chosen_model = model or self._default_model
         messages: list[dict] = [
@@ -153,11 +155,12 @@ class GPTClient:
             raise ValueError(
                 "an enabled cost_ledger is required when repository tools are enabled"
             )
-        response_format = (
-            REVIEW_PARTIAL_RESPONSE_FORMAT
-            if response_model is ReviewPartial
-            else REVIEW_RESPONSE_FORMAT
-        )
+        if response_format is None:
+            response_format = (
+                REVIEW_PARTIAL_RESPONSE_FORMAT
+                if response_model is ReviewPartial
+                else REVIEW_RESPONSE_FORMAT
+            )
 
         if not use_tools:
             kwargs = {

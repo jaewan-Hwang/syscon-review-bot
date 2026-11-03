@@ -32,6 +32,7 @@ from src.review.prompt_builder import build_analysis_system_prompt, build_user_p
 from src.review.structured_output import (
     REVIEW_PARTIAL_RESPONSE_FORMAT,
     REVIEW_RESPONSE_FORMAT,
+    build_scoped_partial_response_format,
 )
 from src.review.token_counter import count_tokens, truncate_tokens
 from src.review.tool_executor import ToolExecutor
@@ -460,13 +461,16 @@ def _request_envelopes(
     include_synthesis: bool,
     synthesis_paths: list[str],
     include_judge: bool = False,
+    response_formats: list[dict] | None = None,
 ) -> list[tuple[int, int]]:
     response_format = (
         REVIEW_PARTIAL_RESPONSE_FORMAT if include_synthesis else REVIEW_RESPONSE_FORMAT
     )
 
     requests: list[tuple[int, int]] = []
-    for system, user in prompts:
+    if response_formats is not None and len(response_formats) != len(prompts):
+        raise ValueError("response formats must match review prompts")
+    for index, (system, user) in enumerate(prompts):
         base = _request_payload_tokens(
             system,
             user,
@@ -474,7 +478,9 @@ def _request_envelopes(
             output_cap=output_cap,
             use_tools=use_tools,
             reasoning_effort=reasoning_effort,
-            response_format=response_format,
+            response_format=(
+                response_formats[index] if response_formats is not None else response_format
+            ),
         )
         requests.append((base, output_cap))
     if include_synthesis:
@@ -549,6 +555,7 @@ async def run_review_pipeline(
         prompts = [(system_prompt, user_prompt)]
         use_tools = tool_executor is not None and reasoning_effort is None
         include_synthesis = False
+        partial_formats = None
     else:
         prompts = []
         analysis_system_prompt = build_analysis_system_prompt()
@@ -599,6 +606,13 @@ async def run_review_pipeline(
         )
         use_tools = tool_executor is not None and reasoning_effort is None
         include_synthesis = True
+        partial_formats = [
+            build_scoped_partial_response_format(unit.unit_id, unit.paths)
+            for unit in plan.units
+        ]
+        partial_formats.append(
+            build_scoped_partial_response_format("global", plan.coverage.required_paths)
+        )
 
     requests = _request_envelopes(
         prompts,
@@ -609,6 +623,7 @@ async def run_review_pipeline(
         include_synthesis=include_synthesis,
         synthesis_paths=plan.coverage.required_paths,
         include_judge=include_judge,
+        response_formats=partial_formats,
     )
     estimate = estimate_preflight_nusd(
         requests, pricing, margin_bps=cost_policy.preflight_margin_bps
@@ -666,6 +681,7 @@ async def run_review_pipeline(
                 cost_ledger=ledger,
                 cost_stage=f"analysis-{index}",
                 response_model=ReviewPartial,
+                response_format=partial_formats[index - 1],
             )
             if not isinstance(partial, ReviewPartial):
                 raise ReviewInfraError(

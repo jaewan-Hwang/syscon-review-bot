@@ -40,3 +40,17 @@ REVIEW_RESPONSE_FORMAT = build_review_response_format()
 REVIEW_PARTIAL_RESPONSE_FORMAT = build_model_response_format(
     ReviewPartial, "review_partial"
 )
+
+
+def build_scoped_partial_response_format(
+    unit_id: str, assigned_paths: list[str]
+) -> dict[str, Any]:
+    response_format = deepcopy(REVIEW_PARTIAL_RESPONSE_FORMAT)
+    schema = response_format["json_schema"]["schema"]
+    schema["properties"]["unit_id"]["enum"] = [unit_id]
+    schema["properties"]["covered_paths"]["items"]["enum"] = list(assigned_paths)
+    file_options = schema["$defs"]["ScopedFinding"]["properties"]["file"]["anyOf"]
+    next(option for option in file_options if option["type"] == "string")["enum"] = list(
+        assigned_paths
+    )
+    return response_format

@@ -21,12 +21,17 @@ from src.review.pipeline import (
     PreflightCostExceeded,
     _validate_synthesis_result,
     _request_envelopes,
+    _request_payload_tokens,
     reduce_review_results,
     reduce_review_partials,
     run_review_pipeline,
 )
 from src.review.errors import ReviewInfraCategory, ReviewInfraError
 from src.review.size_router import SizeRoutingPolicy, build_review_plan
+from src.review.structured_output import (
+    REVIEW_PARTIAL_RESPONSE_FORMAT,
+    build_scoped_partial_response_format,
+)
 
 
 def _files(count: int = 2) -> list[FileDiff]:
@@ -251,6 +256,30 @@ def test_preflight_envelope_includes_schema_messages_and_tool_definition():
     assert len(with_tools) == 1
 
 
+def test_preflight_envelope_prices_the_actual_scoped_schema():
+    prompts = [("system", "user")]
+    scoped = build_scoped_partial_response_format("shard-1", ["very/long/assigned/path.py"])
+    requests = _request_envelopes(
+        prompts,
+        model="gpt-5.4-mini",
+        output_cap=100,
+        use_tools=False,
+        reasoning_effort=None,
+        include_synthesis=True,
+        synthesis_paths=["very/long/assigned/path.py"],
+        response_formats=[scoped],
+    )
+    assert requests[0][0] == _request_payload_tokens(
+        "system", "user", model="gpt-5.4-mini", output_cap=100,
+        use_tools=False, reasoning_effort=None, response_format=scoped,
+    )
+    assert requests[0][0] > _request_payload_tokens(
+        "system", "user", model="gpt-5.4-mini", output_cap=100,
+        use_tools=False, reasoning_effort=None,
+        response_format=REVIEW_PARTIAL_RESPONSE_FORMAT,
+    )
+
+
 def test_reducer_deduplicates_by_location_and_keeps_highest_confidence():
     low = ReviewResult(
         spec_status=SpecStatus.PRESENT,
@@ -328,6 +357,20 @@ async def test_multi_pipeline_uses_shared_ledger_and_returns_one_final_result():
     )
     ledgers = [call.kwargs["cost_ledger"] for call in gpt.review.await_args_list]
     assert len({id(ledger) for ledger in ledgers}) == 1
+
+    for index, call in enumerate(gpt.review.await_args_list):
+        expected_unit = plan.units[index].unit_id if index < len(plan.units) else "global"
+        expected_paths = (
+            plan.units[index].paths if index < len(plan.units)
+            else plan.coverage.required_paths
+        )
+        schema = call.kwargs["response_format"]["json_schema"]["schema"]
+        assert schema["properties"]["unit_id"]["enum"] == [expected_unit]
+        assert schema["properties"]["covered_paths"]["items"]["enum"] == expected_paths
+        assert schema["$defs"]["ScopedFinding"]["properties"]["file"]["anyOf"] == [
+            {"type": "string", "enum": expected_paths}, {"type": "null"}
+        ]
+    assert len({id(call.kwargs["response_format"]) for call in gpt.review.await_args_list}) == 3
 
 
 @pytest.mark.asyncio
@@ -487,6 +530,8 @@ async def test_single_parse_failure_has_single_stage_context():
     assert exc_info.value is error
     assert exc_info.value.stage == "single"
     assert exc_info.value.unit_id is None
+    assert gpt.review.call_args.kwargs["response_model"] is ReviewResult
+    assert "response_format" not in gpt.review.call_args.kwargs
 
 
 @pytest.mark.asyncio

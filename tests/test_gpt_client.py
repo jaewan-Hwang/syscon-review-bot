@@ -9,6 +9,7 @@ from src.review.gpt_client import GPTClient
 from src.models.review import ReviewResult, SpecStatus
 from src.models.review_pipeline import ReviewPartial
 from src.review.errors import ReviewInfraCategory, ReviewInfraError
+from src.review.structured_output import build_scoped_partial_response_format
 from src.review.cost import (
     CostLedger,
     CostLimitExceeded,
@@ -76,6 +77,22 @@ class TestGPTClient:
         ]
         assert response_format["json_schema"]["name"] == "review_partial"
         assert response_format["json_schema"]["strict"] is True
+
+    @pytest.mark.asyncio
+    async def test_internal_review_passes_scoped_schema_in_actual_api_payload(self):
+        gpt = GPTClient(api_key="x")
+        payload = json.dumps({
+            "unit_id": "shard-2", "covered_paths": ["src/b.py"],
+            "spec_status": "present", "aligned": True, "summary": "ok",
+            "findings": [], "prior_resolved": [],
+        })
+        gpt._client = MagicMock()
+        gpt._client.chat.completions.create = AsyncMock(
+            return_value=_mock_msg(content=payload, finish_reason="stop")
+        )
+        scoped = build_scoped_partial_response_format("shard-2", ["src/b.py"])
+        await gpt.review("sys", "usr", response_model=ReviewPartial, response_format=scoped)
+        assert gpt._client.chat.completions.create.call_args.kwargs["response_format"] == scoped
 
     @pytest.mark.asyncio
     async def test_default_client_uses_gpt_5_4_mini(self):
